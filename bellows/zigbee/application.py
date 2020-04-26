@@ -232,6 +232,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def _cfg(self, config_id, value, optional=False):
         v = await self._ezsp.setConfigurationValue(config_id, value)
+
+        if v[0] == t.EzspStatus.ERROR_INVALID_ID:
+            return
+
         if not optional:
             assert v[0] == t.EmberStatus.SUCCESS  # TODO: Better check
 
