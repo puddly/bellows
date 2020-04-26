@@ -239,13 +239,6 @@ EZSP_SCHEMA = {
         int, vol.Range(min=0, max=1)
     ),
     #
-    # Deprecated
-    # The amount of time a trust center will store a transient key
-    # with which a device can use to join the network
-    vol.Optional(c.CONFIG_TRANSIENT_KEY_TIMEOUT_S.name, default=180): vol.All(
-        int, vol.Range(min=0, max=65535)
-    ),
-    #
     # The number of packet buffers available to the stack. When set to the special
     # value 0xFF, the NCP will allocate all remaining configuration RAM towards packet
     # buffers, such that the resulting count will be the largest whole number of packet

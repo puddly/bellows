@@ -230,14 +230,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         await self._ezsp.formNetwork(parameters)
         await self._ezsp.setValue(t.EzspValueId.VALUE_STACK_TOKEN_WRITING, 1)
 
-    async def _cfg(self, config_id, value, optional=False):
+    async def _cfg(self, config_id, value):
         v = await self._ezsp.setConfigurationValue(config_id, value)
-
-        if v[0] == t.EzspStatus.ERROR_INVALID_ID:
-            return
-
-        if not optional:
-            assert v[0] == t.EmberStatus.SUCCESS  # TODO: Better check
+        assert v[0] == t.EmberStatus.SUCCESS  # TODO: Better check
 
     async def _policy(self):
         """Set up the policies for what the NCP should do"""
