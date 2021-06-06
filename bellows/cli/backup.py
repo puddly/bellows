@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ from zigpy.config.validators import cv_hex, cv_key
 import zigpy.types
 import zigpy.zdo.types
 
+import bellows
 import bellows.types as t
 
 from . import util
@@ -92,33 +94,75 @@ async def _backup(ezsp):
     assert node_type == ezsp.types.EmberNodeType.COORDINATOR
     LOGGER.debug("Network params: %s", network)
 
-    (node_id,) = await ezsp.getNodeId()
     (ieee,) = await ezsp.getEui64()
 
+    (status, nwk_key) = await ezsp.getKey(ezsp.types.EmberKeyType.CURRENT_NETWORK_KEY)
+    assert status == t.EmberStatus.SUCCESS
+    LOGGER.debug("Network key: %s", nwk_key)
+
+    (status, tclk) = await ezsp.getKey(ezsp.types.EmberKeyType.TRUST_CENTER_LINK_KEY)
+    assert status == t.EmberStatus.SUCCESS
+    LOGGER.debug("TCLK: %s", tclk)
+
+    addresses = {}
+
+    for idx in range(0, 255 + 1):
+        (entry_is_active,) = await ezsp.addressTableEntryIsActive(idx)
+
+        if not entry_is_active:
+            continue
+
+        (nwk,) = await ezsp.getAddressTableRemoteNodeId(idx)
+        (eui64,) = await ezsp.getAddressTableRemoteEui64(idx)
+
+        LOGGER.debug("NWK for %s is %s", eui64, nwk)
+        addresses[eui64] = nwk
+
+    keys = {}
+
+    for idx in range(0, 192):
+        LOGGER.debug("Getting key index %s", idx)
+        (status, key_struct) = await ezsp.getKeyTableEntry(idx)
+        if status == t.EmberStatus.INDEX_OUT_OF_RANGE:
+            break
+        elif status == t.EmberStatus.SUCCESS:
+            keys[key_struct.partnerEUI64] = key_struct
+
+    now = datetime.datetime.now().astimezone()
     result = {
-        ATTR_NODE_TYPE: node_type.value,
-        ATTR_NODE_ID: node_id,
-        ATTR_NODE_EUI64: str(ieee),
-        ATTR_PAN_ID: network.panId,
-        ATTR_EXT_PAN_ID: str(network.extendedPanId),
-        ATTR_RADIO_CHANNEL: network.radioChannel,
-        ATTR_RADIO_TX_PWR: network.radioTxPower,
-        ATTR_NWK_UPDATE_ID: network.nwkUpdateId,
-        ATTR_CHANNELS: network.channels,
+        "metadata": {
+            "version": 1,
+            "format": "zigpy/open-coordinator-backup",
+            "source": f"bellows@{bellows.__version__}",
+            "internal": {
+                "creation_time": now.isoformat(timespec="seconds"),
+            },
+        },
+        "coordinator_ieee": ieee.serialize()[::-1].hex(),
+        "pan_id": network.panId.serialize()[::-1].hex(),
+        "extended_pan_id": network.extendedPanId.serialize()[::-1].hex(),
+        "nwk_update_id": network.nwkUpdateId,
+        # "security_level": network.security_level,
+        "channel": network.radioChannel,
+        "channel_mask": list(network.channels),
+        "network_key": {
+            "key": nwk_key.key.serialize().hex(),
+            "sequence_number": nwk_key.sequenceNumber,
+            "frame_counter": nwk_key.outgoingFrameCounter,
+        },
+        "devices": [
+            {
+                "ieee_address": key.partnerEUI64.serialize()[::-1].hex(),
+                "link_key": {
+                    "key": key.key.serialize().hex(),
+                    "rx_counter": key.incomingFrameCounter,
+                    "tx_counter": key.outgoingFrameCounter,
+                },
+                "nwk_address": None,
+            }
+            for key in []
+        ],
     }
-
-    for key_name, key_type in (
-        (ATTR_KEY_GLOBAL, ezsp.types.EmberKeyType.TRUST_CENTER_LINK_KEY),
-        (ATTR_KEY_NWK, ezsp.types.EmberKeyType.CURRENT_NETWORK_KEY),
-    ):
-        (status, key) = await ezsp.getKey(key_type)
-        assert status == t.EmberStatus.SUCCESS
-        LOGGER.debug("%s key: %s", key_name, key)
-        result[key_name] = key.as_dict()
-        result[key_name][ATTR_KEY_PARTNER] = str(key.partnerEUI64)
-
-    keys = await _backup_keys(ezsp)
-    result[ATTR_KEY_TABLE] = keys
 
     click.echo(json.dumps(result))
 
@@ -131,9 +175,7 @@ async def _backup_keys(ezsp):
         LOGGER.debug("Getting key index %s", idx)
         (status, key_struct) = await ezsp.getKeyTableEntry(idx)
         if status == t.EmberStatus.SUCCESS:
-            key_dict = key_struct.as_dict()
-            key_dict[ATTR_KEY_PARTNER] = str(key_struct.partnerEUI64)
-            keys.append(key_dict)
+            keys.append(key_struct)
         elif status == t.EmberStatus.INDEX_OUT_OF_RANGE:
             break
     return keys
