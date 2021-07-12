@@ -143,6 +143,7 @@ async def _backup(ezsp):
         "extended_pan_id": network.extendedPanId.serialize()[::-1].hex(),
         "nwk_update_id": network.nwkUpdateId,
         # "security_level": network.security_level,
+        "security_level": 5,
         "channel": network.radioChannel,
         "channel_mask": list(network.channels),
         "network_key": {
