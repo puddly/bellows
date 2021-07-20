@@ -148,6 +148,11 @@ async def _backup(ezsp):
                 "creation_time": now.isoformat(timespec="seconds"),
             },
         },
+        "stack_specific": {
+            "ezsp": {
+                "tx_power": network.radioTxPower,
+            }
+        },
         "coordinator_ieee": ieee.serialize()[::-1].hex(),
         "pan_id": network.panId.serialize()[::-1].hex(),
         "extended_pan_id": network.extendedPanId.serialize()[::-1].hex(),
