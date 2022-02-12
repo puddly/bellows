@@ -1,5 +1,13 @@
 """Setup module for bellows"""
 
+raise RuntimeError(
+    "\n" * 10
+    + "#######################################################################################\n"
+    + "This branch is obsolete!  Please test https://github.com/zigpy/zigpy-cli/pull/2 instead\n"
+    + "#######################################################################################\n"
+    + "\n" * 10
+)
+
 from setuptools import find_packages, setup
 
 import bellows
