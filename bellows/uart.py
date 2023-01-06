@@ -166,7 +166,7 @@ class Gateway(asyncio.Protocol):
         self._startup_reset_future = asyncio.get_running_loop().create_future()
 
         try:
-            await self._startup_reset_future
+            await asyncio.shield(self._startup_reset_future)
         finally:
             self._startup_reset_future = None
 
