@@ -197,9 +197,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self.devices[self.state.node_info.ieee] = ezsp_device
 
         # The coordinator device does not respond to attribute reads
+        brd_manuf, brd_name, version = await self._get_board_info()
         ezsp_device.endpoints[1] = EZSPEndpoint(ezsp_device, 1)
-        ezsp_device.model = ezsp_device.endpoints[1].model
-        ezsp_device.manufacturer = ezsp_device.endpoints[1].manufacturer
+        ezsp_device.model = brd_name
+        ezsp_device.manufacturer = brd_manuf
         await ezsp_device.schedule_initialize()
 
         # Group membership is stored in the database for EZSP coordinators
