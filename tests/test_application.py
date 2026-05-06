@@ -1989,6 +1989,85 @@ async def test_connect_failure(app: ControllerApplication) -> None:
     assert len(ezsp.disconnect.mock_calls) == 1
 
 
+async def test_connect_cancelled_still_disconnects(app: ControllerApplication) -> None:
+    """A `CancelledError` raised inside `connect` must still release the EZSP."""
+    ezsp = app._ezsp
+    app._ezsp.write_config = AsyncMock(side_effect=asyncio.CancelledError())
+    app._ezsp.connect = AsyncMock()
+    app._ezsp = None
+
+    with patch("bellows.ezsp.EZSP", return_value=ezsp):
+        with pytest.raises(asyncio.CancelledError):
+            await app.connect()
+
+    assert app._ezsp is None
+    assert len(ezsp.disconnect.mock_calls) == 1
+
+
+async def test_connect_outer_cancel_still_disconnects(
+    app: ControllerApplication,
+) -> None:
+    """An external `task.cancel()` mid-connect must still release the EZSP."""
+    ezsp = app._ezsp
+    write_config_started = asyncio.Event()
+
+    async def slow_write_config(*args, **kwargs):
+        write_config_started.set()
+        await asyncio.sleep(60)
+
+    app._ezsp.write_config = AsyncMock(side_effect=slow_write_config)
+    app._ezsp.connect = AsyncMock()
+    app._ezsp = None
+
+    with patch("bellows.ezsp.EZSP", return_value=ezsp):
+        task = asyncio.create_task(app.connect())
+        await write_config_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert app._ezsp is None
+    assert len(ezsp.disconnect.mock_calls) == 1
+
+
+async def test_connect_disconnect_completes_under_repeated_cancel(
+    app: ControllerApplication,
+) -> None:
+    """A second cancel landing inside `disconnect` must not interrupt cleanup."""
+    ezsp = app._ezsp
+    write_config_started = asyncio.Event()
+    disconnect_started = asyncio.Event()
+    disconnect_steps: list[str] = []
+
+    async def slow_write_config(*args, **kwargs):
+        write_config_started.set()
+        await asyncio.sleep(60)
+
+    async def multi_step_disconnect(*args, **kwargs):
+        disconnect_steps.append("started")
+        disconnect_started.set()
+        await asyncio.sleep(0.01)
+        disconnect_steps.append("done")
+
+    app._ezsp.write_config = AsyncMock(side_effect=slow_write_config)
+    app._ezsp.connect = AsyncMock()
+    app._ezsp.disconnect = AsyncMock(side_effect=multi_step_disconnect)
+    app._ezsp = None
+
+    with patch("bellows.ezsp.EZSP", return_value=ezsp):
+        task = asyncio.create_task(app.connect())
+        await write_config_started.wait()
+        task.cancel()
+        await asyncio.wait_for(disconnect_started.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Allow any detached (shielded) disconnect to finish
+        await asyncio.sleep(0.05)
+
+    assert disconnect_steps == ["started", "done"]
+
+
 async def test_repair_tclk_partner_ieee(
     app: ControllerApplication, ieee: zigpy_t.EUI64
 ) -> None:
