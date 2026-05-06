@@ -192,9 +192,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
             self._created_device_endpoints.clear()
             await self.register_endpoints()
-        except Exception:
+        except BaseException:
             if self._ezsp is not None:
-                await self._ezsp.disconnect()
+                await asyncio.shield(self._ezsp.disconnect())
                 self._ezsp = None
             raise
 
