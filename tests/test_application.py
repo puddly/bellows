@@ -9,6 +9,7 @@ import zigpy.backups
 import zigpy.config
 import zigpy.device
 import zigpy.exceptions
+import zigpy.scheduler
 import zigpy.types as zigpy_t
 import zigpy.zdo.types as zdo_t
 
@@ -788,7 +789,8 @@ async def test_request_concurrency_duplicate_failure(
     )
 
     await app.send_packet(packet)
-    app._concurrent_requests_semaphore.max_concurrency = 10000
+    app._scheduler.max_in_flight = 10000
+    app._scheduler.destination_window = None
     results = await asyncio.gather(
         *(app.send_packet(packet) for _ in range(256 + 1)), return_exceptions=True
     )
@@ -1200,11 +1202,57 @@ async def test_send_packet_unicast_unexpected_failure(app, packet):
         await _test_send_packet_unicast(app, packet, status=t.EmberStatus.ERR_FATAL)
 
 
-async def test_send_packet_unicast_retries_failure(app, packet):
-    with pytest.raises(zigpy.exceptions.DeliveryError):
+async def test_send_packet_unicast_permanent_enqueue_failure(app, packet):
+    with pytest.raises(zigpy.exceptions.PermanentSendError):
         await _test_send_packet_unicast(
-            app, packet, status=bellows.types.sl_Status.ALLOCATION_FAILED
+            app, packet, status=bellows.types.sl_Status.MESSAGE_TOO_LONG
         )
+
+    assert len(app._pending_requests) == 0
+
+
+async def test_send_packet_unicast_transient_backpressure(app, packet, monkeypatch):
+    monkeypatch.setattr(zigpy.scheduler, "DEFAULT_GLOBAL_BACKOFF", 0.01)
+
+    statuses = [
+        bellows.types.sl_Status.ALLOCATION_FAILED,
+        bellows.types.sl_Status.ZIGBEE_MAX_MESSAGE_LIMIT_REACHED,
+        bellows.types.sl_Status.OK,
+    ]
+
+    def send_unicast(*args, **kwargs):
+        status = statuses.pop(0)
+
+        if status == bellows.types.sl_Status.OK:
+            asyncio.get_running_loop().call_later(
+                0.01,
+                app.ezsp_callback_handler,
+                "messageSentHandler",
+                list(
+                    dict(
+                        type=t.EmberOutgoingMessageType.OUTGOING_DIRECT,
+                        indexOrDestination=0x1234,
+                        apsFrame=sentinel.aps,
+                        messageTag=MSG_TAG,
+                        status=bellows.types.sl_Status.OK,
+                        message=b"",
+                    ).values()
+                ),
+            )
+
+        return [status, 0x12]
+
+    app._ezsp.send_unicast = AsyncMock(
+        side_effect=send_unicast, spec=app._ezsp.send_unicast
+    )
+    app.get_sequence = MagicMock(return_value=MSG_TAG)
+
+    # Radio backpressure delays the frame instead of failing the send
+    await app.send_packet(packet)
+
+    assert len(app._ezsp.send_unicast.mock_calls) == 3
+    assert not statuses
+    assert len(app._pending_requests) == 0
 
 
 async def test_send_packet_unicast_delivery_failure_sent_handler(
@@ -1235,7 +1283,8 @@ async def test_send_packet_unicast_concurrency(app, packet, monkeypatch):
     monkeypatch.setattr(bellows.zigbee.application, "MESSAGE_SEND_TIMEOUT_MAINS", 0.5)
     monkeypatch.setattr(bellows.zigbee.application, "MESSAGE_SEND_TIMEOUT_BATTERY", 0.5)
 
-    app._concurrent_requests_semaphore.max_concurrency = 12
+    app._scheduler.max_in_flight = 12
+    app._scheduler.destination_window = None
 
     max_concurrency = 0
     in_flight_requests = 0

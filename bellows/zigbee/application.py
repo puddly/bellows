@@ -47,8 +47,10 @@ from bellows.zigbee import repairs
 from bellows.zigbee.device import EZSPEndpoint, EZSPGroupEndpoint
 import bellows.zigbee.util as util
 
-MESSAGE_SEND_TIMEOUT_MAINS = 3
-MESSAGE_SEND_TIMEOUT_BATTERY = 8
+# Longer than the NCP's own worst-case verdict (route discovery retries take ~5s),
+# so its `messageSentHandler` status is consumed instead of racing it with a timeout
+MESSAGE_SEND_TIMEOUT_MAINS = 10
+MESSAGE_SEND_TIMEOUT_BATTERY = 15
 
 COUNTER_EZSP_BUFFERS = "EZSP_FREE_BUFFERS"
 COUNTER_NWK_CONFLICTS = "nwk_conflicts"
@@ -955,7 +957,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._check_status(status)
         self._packet_capture_channel = channel
 
-    async def send_packet(self, packet: zigpy.types.ZigbeePacket) -> None:
+    async def _send_packet(self, packet: zigpy.types.ZigbeePacket) -> None:
         if not self.is_controller_running:
             raise ControllerError("ApplicationController is not running")
 
@@ -1016,134 +1018,163 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             # We disable extended timeout if we enable ACKs
             extended_timeout = False
 
-        async with self._limit_concurrency(priority=packet.priority):
-            message_tag = self.get_sequence()
-            pending_tag = (packet.dst.address, message_tag)
+        message_tag = self.get_sequence()
+        pending_tag = (packet.dst.address, message_tag)
 
-            if pending_tag in self._pending_requests:
-                raise zigpy.exceptions.DeliveryError(
-                    f"Packet with tag {pending_tag} is already pending, cannot send"
-                )
+        if pending_tag in self._pending_requests:
+            raise zigpy.exceptions.DeliveryError(
+                f"Packet with tag {pending_tag} is already pending, cannot send"
+            )
 
-            future = self._pending_requests[pending_tag] = asyncio.Future()
+        future = self._pending_requests[pending_tag] = asyncio.Future()
 
-            try:
-                async with self._req_lock:
-                    data = packet.data.serialize()
+        try:
+            async with self._req_lock:
+                data = packet.data.serialize()
 
-                    if packet.dst.addr_mode == zigpy.types.AddrMode.NWK:
-                        # Manual source routes are installed through XNCP; native
-                        # source routes cannot be folded into the combined command
-                        use_manual_source_route = (
-                            packet.source_route is not None
-                            and (
-                                FirmwareFeatures.MANUAL_SOURCE_ROUTE
-                                in self._ezsp._xncp_features
-                            )
-                            and self.config[CONF_BELLOWS_CONFIG][
-                                CONF_MANUAL_SOURCE_ROUTING
-                            ]
+                if packet.dst.addr_mode == zigpy.types.AddrMode.NWK:
+                    # Manual source routes are installed through XNCP; native
+                    # source routes cannot be folded into the combined command
+                    use_manual_source_route = (
+                        packet.source_route is not None
+                        and (
+                            FirmwareFeatures.MANUAL_SOURCE_ROUTE
+                            in self._ezsp._xncp_features
                         )
+                        and self.config[CONF_BELLOWS_CONFIG][CONF_MANUAL_SOURCE_ROUTING]
+                    )
 
-                        # XNCP combined unicasts can fail in a few ways so it's simpler
-                        # to prepare the request in advance
-                        xncp_unicast = None
+                    # XNCP combined unicasts can fail in a few ways so it's simpler
+                    # to prepare the request in advance
+                    xncp_unicast = None
 
-                        if (
-                            FirmwareFeatures.COMBINED_SEND in self._ezsp._xncp_features
-                            and (packet.source_route is None or use_manual_source_route)
-                        ):
-                            try:
-                                xncp_unicast = self._ezsp.xncp_prepare_unicast(
-                                    destination=packet.dst.address,
-                                    aps_frame=aps_frame,
-                                    message_tag=message_tag,
-                                    data=data,
-                                    source_route=(
-                                        packet.source_route
-                                        if use_manual_source_route
-                                        else None
-                                    ),
-                                    extended_timeout=(
-                                        (device.ieee, extended_timeout)
-                                        if device is not None
-                                        else None
-                                    ),
-                                )
-                            except PayloadTooLongError:
-                                xncp_unicast = None
-
-                        if xncp_unicast is not None:
-                            status, _ = await self._ezsp.xncp_send_unicast(xncp_unicast)
-                        else:
-                            if device is not None:
-                                await self._ezsp.set_extended_timeout(
-                                    nwk=device.nwk,
-                                    ieee=device.ieee,
-                                    extended_timeout=extended_timeout,
-                                )
-
-                            if packet.source_route is not None:
-                                if use_manual_source_route:
-                                    await self._ezsp.xncp_set_manual_source_route(
-                                        destination=packet.dst.address,
-                                        route=packet.source_route,
-                                    )
-                                else:
-                                    await self._ezsp.set_source_route(
-                                        nwk=packet.dst.address,
-                                        relays=packet.source_route,
-                                    )
-
-                            status, _ = await self._ezsp.send_unicast(
-                                nwk=packet.dst.address,
+                    if (
+                        FirmwareFeatures.COMBINED_SEND in self._ezsp._xncp_features
+                        and (packet.source_route is None or use_manual_source_route)
+                    ):
+                        try:
+                            xncp_unicast = self._ezsp.xncp_prepare_unicast(
+                                destination=packet.dst.address,
                                 aps_frame=aps_frame,
                                 message_tag=message_tag,
                                 data=data,
+                                source_route=(
+                                    packet.source_route
+                                    if use_manual_source_route
+                                    else None
+                                ),
+                                extended_timeout=(
+                                    (device.ieee, extended_timeout)
+                                    if device is not None
+                                    else None
+                                ),
                             )
-                    elif packet.dst.addr_mode == zigpy.types.AddrMode.Group:
-                        status, _ = await self._ezsp.send_multicast(
+                        except PayloadTooLongError:
+                            xncp_unicast = None
+
+                    if xncp_unicast is not None:
+                        status, _ = await self._ezsp.xncp_send_unicast(xncp_unicast)
+                    else:
+                        if device is not None:
+                            await self._ezsp.set_extended_timeout(
+                                nwk=device.nwk,
+                                ieee=device.ieee,
+                                extended_timeout=extended_timeout,
+                            )
+
+                        if packet.source_route is not None:
+                            if use_manual_source_route:
+                                await self._ezsp.xncp_set_manual_source_route(
+                                    destination=packet.dst.address,
+                                    route=packet.source_route,
+                                )
+                            else:
+                                await self._ezsp.set_source_route(
+                                    nwk=packet.dst.address,
+                                    relays=packet.source_route,
+                                )
+
+                        status, _ = await self._ezsp.send_unicast(
+                            nwk=packet.dst.address,
                             aps_frame=aps_frame,
-                            radius=packet.radius,
-                            non_member_radius=packet.non_member_radius,
                             message_tag=message_tag,
                             data=data,
                         )
-                    elif packet.dst.addr_mode == zigpy.types.AddrMode.Broadcast:
-                        status, _ = await self._ezsp.send_broadcast(
-                            address=packet.dst.address,
-                            aps_frame=aps_frame,
-                            radius=packet.radius,
-                            message_tag=message_tag,
-                            aps_sequence=packet.tsn,
-                            data=data,
-                        )
-
-                if status != t.sl_Status.OK:
-                    raise zigpy.exceptions.DeliveryError(
-                        f"Failed to enqueue message: {status!r}", status
+                elif packet.dst.addr_mode == zigpy.types.AddrMode.Group:
+                    status, _ = await self._ezsp.send_multicast(
+                        aps_frame=aps_frame,
+                        radius=packet.radius,
+                        non_member_radius=packet.non_member_radius,
+                        message_tag=message_tag,
+                        data=data,
+                    )
+                elif packet.dst.addr_mode == zigpy.types.AddrMode.Broadcast:
+                    status, _ = await self._ezsp.send_broadcast(
+                        address=packet.dst.address,
+                        aps_frame=aps_frame,
+                        radius=packet.radius,
+                        message_tag=message_tag,
+                        aps_sequence=packet.tsn,
+                        data=data,
                     )
 
-                # Only throw a delivery exception for packets sent with NWK addressing.
-                # https://github.com/home-assistant/core/issues/79832
-                # Broadcasts/multicasts don't have ACKs or confirmations either.
-                if packet.dst.addr_mode != zigpy.types.AddrMode.NWK:
-                    return
+            if status in (
+                t.sl_Status.BUSY,
+                t.sl_Status.ALLOCATION_FAILED,  # EmberStatus.NO_BUFFERS
+                # EmberStatus.NETWORK_BUSY also collapses into this status but that is
+                # fine: at enqueue time every busy status is queue/table pressure
+                # (modern firmware reports BUSY for the same condition legacy firmware
+                # calls NETWORK_BUSY; CSMA congestion only surfaces in the delivery
+                # verdict), so the wake-on-confirm retry of RadioBusyError is correct
+                # for all of them
+                t.sl_Status.ZIGBEE_MAX_MESSAGE_LIMIT_REACHED,
+            ):
+                raise zigpy.exceptions.RadioBusyError(
+                    f"Failed to enqueue message: {status!r}", status
+                )
+            elif status == t.sl_Status.MESSAGE_TOO_LONG:
+                raise zigpy.exceptions.PermanentSendError(
+                    f"Failed to enqueue message: {status!r}", status
+                )
+            elif status == t.sl_Status.CCA_FAILURE:
+                raise zigpy.exceptions.CcaFailureError(
+                    f"Failed to enqueue message: {status!r}", status
+                )
+            elif status != t.sl_Status.OK:
+                raise zigpy.exceptions.SendError(
+                    f"Failed to enqueue message: {status!r}", status
+                )
 
-                # Wait for `messageSentHandler` message
-                async with asyncio_timeout(
-                    MESSAGE_SEND_TIMEOUT_MAINS
-                    if not packet.extended_timeout
-                    else MESSAGE_SEND_TIMEOUT_BATTERY
-                ):
-                    send_status, _ = await future
+            # Only throw a delivery exception for packets sent with NWK addressing.
+            # https://github.com/home-assistant/core/issues/79832
+            # Broadcasts/multicasts don't have ACKs or confirmations either.
+            if packet.dst.addr_mode != zigpy.types.AddrMode.NWK:
+                return
 
-                if t.sl_Status.from_ember_status(send_status) != t.sl_Status.OK:
-                    raise zigpy.exceptions.DeliveryError(
-                        f"Failed to deliver message: {send_status!r}", send_status
-                    )
-            finally:
-                del self._pending_requests[pending_tag]
+            # Wait for `messageSentHandler` message
+            async with asyncio_timeout(
+                MESSAGE_SEND_TIMEOUT_MAINS
+                if not packet.extended_timeout
+                else MESSAGE_SEND_TIMEOUT_BATTERY
+            ):
+                send_status, _ = await future
+
+            send_status = t.sl_Status.from_ember_status(send_status)
+
+            if send_status == t.sl_Status.ZIGBEE_SEND_UNICAST_NO_ROUTE:
+                raise zigpy.exceptions.NoRouteError(
+                    f"Failed to deliver message: {send_status!r}", send_status
+                )
+            elif send_status == t.sl_Status.CCA_FAILURE:
+                raise zigpy.exceptions.CcaFailureError(
+                    f"Failed to deliver message: {send_status!r}", send_status
+                )
+            elif send_status != t.sl_Status.OK:
+                raise zigpy.exceptions.DeliveryError(
+                    f"Failed to deliver message: {send_status!r}", send_status
+                )
+        finally:
+            del self._pending_requests[pending_tag]
 
     async def permit(self, time_s: int = 60, node: t.EmberNodeId = None) -> None:
         """Permit joining."""
