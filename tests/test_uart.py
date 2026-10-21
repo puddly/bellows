@@ -507,18 +507,20 @@ async def real_gw(ncp, app, caplog):
 async def test_process_roundtrip(real_gw, ncp, app, caplog):
     gw = real_gw
     ncps, _ = ncp
-    frames = []
-    app.frame_received.side_effect = frames.append
+    frame = asyncio.get_running_loop().create_future()
+    app.frame_received.side_effect = frame.set_result
 
     assert len(bellows_threads()) == 1
 
     async with asyncio_timeout(1):
         assert await gw.reset() is True
         await gw.send_data(b"\x01\x02\x03")
+        # The NCP's send returns on the worker's ACK, the frame itself may still be in
+        # flight to us
         await ncps[0].send_data(b"\xaa\xbb")
+        assert await frame == b"\xaa\xbb"
 
     assert ncps[0]._ezsp_protocol.data_received.mock_calls == [call(b"\x01\x02\x03")]
-    assert frames == [b"\xaa\xbb"]
 
     # A cancelled wait is cancelled on the worker too: a second one would otherwise fail
     waiting = asyncio.ensure_future(gw.wait_for_startup_reset())
